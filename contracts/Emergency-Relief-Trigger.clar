@@ -11,11 +11,16 @@
 (define-constant ERR_INVALID_ORACLE (err u108))
 (define-constant ERR_POOL_LOCKED (err u109))
 (define-constant ERR_ALREADY_DISTRIBUTED (err u110))
+(define-constant ERR_MILESTONE_NOT_FOUND (err u111))
+(define-constant ERR_INVALID_PERCENTAGE (err u112))
+(define-constant ERR_MILESTONE_COMPLETED (err u113))
+(define-constant ERR_INSUFFICIENT_MILESTONE_FUNDS (err u114))
 
 (define-data-var next-pool-id uint u1)
 (define-data-var next-crisis-id uint u1)
 (define-data-var oracle-address (optional principal) none)
 (define-data-var contract-paused bool false)
+(define-data-var next-milestone-id uint u1)
 
 (define-map donation-pools uint {
     creator: principal,
@@ -55,6 +60,26 @@
 })
 
 (define-map pool-crisis-mapping { pool-id: uint } uint)
+
+(define-map pool-milestones { pool-id: uint, milestone-id: uint } {
+    title: (string-ascii 128),
+    description: (string-ascii 256),
+    percentage: uint,
+    completed: bool,
+    released-amount: uint,
+    created-at: uint,
+    completed-at: (optional uint)
+})
+
+(define-map milestone-progress-reports { pool-id: uint, milestone-id: uint } {
+    organization: principal,
+    report: (string-ascii 512),
+    submitted-at: uint,
+    verified-by: principal,
+    verified-at: uint
+})
+
+(define-map pool-milestone-count { pool-id: uint } uint)
 
 (define-public (set-oracle (new-oracle principal))
     (begin
@@ -161,6 +186,68 @@
             (map-set donation-pools pool-id (merge pool { distributed: true }))
             (ok (get current-amount pool)))))
 
+(define-public (create-milestone (pool-id uint) (title (string-ascii 128)) (description (string-ascii 256)) (percentage uint))
+    (let (
+        (pool (unwrap! (map-get? donation-pools pool-id) ERR_POOL_NOT_FOUND))
+        (milestone-count (default-to u0 (map-get? pool-milestone-count { pool-id: pool-id })))
+        (milestone-id (+ milestone-count u1))
+    )
+        (begin
+            (asserts! (is-eq tx-sender (get creator pool)) ERR_UNAUTHORIZED)
+            (asserts! (and (> percentage u0) (<= percentage u100)) ERR_INVALID_PERCENTAGE)
+            (asserts! (not (get locked pool)) ERR_POOL_LOCKED)
+            (map-set pool-milestones { pool-id: pool-id, milestone-id: milestone-id } {
+                title: title,
+                description: description,
+                percentage: percentage,
+                completed: false,
+                released-amount: u0,
+                created-at: stacks-block-height,
+                completed-at: none
+            })
+            (map-set pool-milestone-count { pool-id: pool-id } milestone-id)
+            (ok milestone-id))))
+
+(define-public (submit-milestone-report (pool-id uint) (milestone-id uint) (report (string-ascii 512)))
+    (let (
+        (pool (unwrap! (map-get? donation-pools pool-id) ERR_POOL_NOT_FOUND))
+        (org (unwrap! (map-get? verified-organizations tx-sender) ERR_ORGANIZATION_NOT_VERIFIED))
+        (milestone (unwrap! (map-get? pool-milestones { pool-id: pool-id, milestone-id: milestone-id }) ERR_MILESTONE_NOT_FOUND))
+    )
+        (begin
+            (asserts! (get active org) ERR_ORGANIZATION_NOT_VERIFIED)
+            (asserts! (not (get completed milestone)) ERR_MILESTONE_COMPLETED)
+            (map-set milestone-progress-reports { pool-id: pool-id, milestone-id: milestone-id } {
+                organization: tx-sender,
+                report: report,
+                submitted-at: stacks-block-height,
+                verified-by: tx-sender,
+                verified-at: stacks-block-height
+            })
+            (ok true))))
+
+(define-public (release-milestone-funds (pool-id uint) (milestone-id uint) (organization principal))
+    (let (
+        (pool (unwrap! (map-get? donation-pools pool-id) ERR_POOL_NOT_FOUND))
+        (milestone (unwrap! (map-get? pool-milestones { pool-id: pool-id, milestone-id: milestone-id }) ERR_MILESTONE_NOT_FOUND))
+        (org (unwrap! (map-get? verified-organizations organization) ERR_ORGANIZATION_NOT_VERIFIED))
+        (report (unwrap! (map-get? milestone-progress-reports { pool-id: pool-id, milestone-id: milestone-id }) ERR_MILESTONE_NOT_FOUND))
+        (release-amount (/ (* (get current-amount pool) (get percentage milestone)) u100))
+    )
+        (begin
+            (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+            (asserts! (get locked pool) ERR_POOL_LOCKED)
+            (asserts! (get active org) ERR_ORGANIZATION_NOT_VERIFIED)
+            (asserts! (not (get completed milestone)) ERR_MILESTONE_COMPLETED)
+            (asserts! (> release-amount u0) ERR_INSUFFICIENT_MILESTONE_FUNDS)
+            (try! (as-contract (stx-transfer? release-amount tx-sender organization)))
+            (map-set pool-milestones { pool-id: pool-id, milestone-id: milestone-id } (merge milestone {
+                completed: true,
+                released-amount: release-amount,
+                completed-at: (some stacks-block-height)
+            }))
+            (ok release-amount))))
+
 (define-private (trigger-fund-release (crisis-id uint) (crisis-type (string-ascii 32)))
     (let ((matching-pools (filter-pools-by-crisis-type crisis-type)))
         (fold lock-matching-pools matching-pools crisis-id)))
@@ -214,4 +301,13 @@
 
 (define-read-only (get-pool-crisis-mapping (pool-id uint))
     (map-get? pool-crisis-mapping { pool-id: pool-id }))
+
+(define-read-only (get-milestone-info (pool-id uint) (milestone-id uint))
+    (map-get? pool-milestones { pool-id: pool-id, milestone-id: milestone-id }))
+
+(define-read-only (get-milestone-report (pool-id uint) (milestone-id uint))
+    (map-get? milestone-progress-reports { pool-id: pool-id, milestone-id: milestone-id }))
+
+(define-read-only (get-pool-milestone-count (pool-id uint))
+    (map-get? pool-milestone-count { pool-id: pool-id }))
 

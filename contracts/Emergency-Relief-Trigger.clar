@@ -15,12 +15,16 @@
 (define-constant ERR_INVALID_PERCENTAGE (err u112))
 (define-constant ERR_MILESTONE_COMPLETED (err u113))
 (define-constant ERR_INSUFFICIENT_MILESTONE_FUNDS (err u114))
+(define-constant ERR_POOL_DEADLINE_NOT_REACHED (err u115))
+(define-constant ERR_NO_CONTRIBUTION (err u116))
+(define-constant ERR_ALREADY_WITHDRAWN (err u117))
 
 (define-data-var next-pool-id uint u1)
 (define-data-var next-crisis-id uint u1)
 (define-data-var oracle-address (optional principal) none)
 (define-data-var contract-paused bool false)
 (define-data-var next-milestone-id uint u1)
+(define-data-var withdrawal-deadline-blocks uint u144)
 
 (define-map donation-pools uint {
     creator: principal,
@@ -81,6 +85,8 @@
 
 (define-map pool-milestone-count { pool-id: uint } uint)
 
+(define-map donor-withdrawals { pool-id: uint, donor: principal } bool)
+
 (define-public (set-oracle (new-oracle principal))
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
@@ -90,6 +96,11 @@
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
         (ok (var-set contract-paused (not (var-get contract-paused))))))
+
+(define-public (set-withdrawal-deadline (blocks uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (ok (var-set withdrawal-deadline-blocks blocks))))
 
 (define-public (create-donation-pool (name (string-ascii 64)) (description (string-ascii 256)) (target-amount uint) (crisis-type (string-ascii 32)))
     (let ((pool-id (var-get next-pool-id)))
@@ -248,6 +259,26 @@
             }))
             (ok release-amount))))
 
+(define-public (withdraw-from-inactive-pool (pool-id uint))
+    (let (
+        (pool (unwrap! (map-get? donation-pools pool-id) ERR_POOL_NOT_FOUND))
+        (contribution (unwrap! (map-get? donor-contributions { pool-id: pool-id, donor: tx-sender }) ERR_NO_CONTRIBUTION))
+        (already-withdrawn (default-to false (map-get? donor-withdrawals { pool-id: pool-id, donor: tx-sender })))
+        (blocks-since-creation (- stacks-block-height (get created-at pool)))
+    )
+        (begin
+            (asserts! (not (get locked pool)) ERR_POOL_LOCKED)
+            (asserts! (not (get distributed pool)) ERR_ALREADY_DISTRIBUTED)
+            (asserts! (>= blocks-since-creation (var-get withdrawal-deadline-blocks)) ERR_POOL_DEADLINE_NOT_REACHED)
+            (asserts! (> contribution u0) ERR_NO_CONTRIBUTION)
+            (asserts! (not already-withdrawn) ERR_ALREADY_WITHDRAWN)
+            (try! (as-contract (stx-transfer? contribution tx-sender tx-sender)))
+            (map-set donor-withdrawals { pool-id: pool-id, donor: tx-sender } true)
+            (map-set donation-pools pool-id (merge pool {
+                current-amount: (- (get current-amount pool) contribution)
+            }))
+            (ok contribution))))
+
 (define-private (trigger-fund-release (crisis-id uint) (crisis-type (string-ascii 32)))
     (let ((matching-pools (filter-pools-by-crisis-type crisis-type)))
         (fold lock-matching-pools matching-pools crisis-id)))
@@ -310,4 +341,27 @@
 
 (define-read-only (get-pool-milestone-count (pool-id uint))
     (map-get? pool-milestone-count { pool-id: pool-id }))
+
+(define-read-only (get-withdrawal-deadline)
+    (var-get withdrawal-deadline-blocks))
+
+(define-read-only (get-donor-withdrawal-status (pool-id uint) (donor principal))
+    (default-to false (map-get? donor-withdrawals { pool-id: pool-id, donor: donor })))
+
+(define-read-only (can-withdraw-from-pool (pool-id uint) (donor principal))
+    (match (map-get? donation-pools pool-id)
+        pool
+            (let (
+                (contribution (default-to u0 (map-get? donor-contributions { pool-id: pool-id, donor: donor })))
+                (already-withdrawn (default-to false (map-get? donor-withdrawals { pool-id: pool-id, donor: donor })))
+                (blocks-since-creation (- stacks-block-height (get created-at pool)))
+            )
+                (and
+                    (not (get locked pool))
+                    (not (get distributed pool))
+                    (>= blocks-since-creation (var-get withdrawal-deadline-blocks))
+                    (> contribution u0)
+                    (not already-withdrawn)
+                ))
+        false))
 
